@@ -2,59 +2,75 @@
 
 set -eo pipefail
 
+df -h
+
 BTRFS_TARGET_DIR="${BTRFS_TARGET_DIR:-$(
     dir=$(podman system info --format '{{.Store.GraphRoot}}' | sed 's|/storage$||')
     mkdir -p "$dir"
     echo "$dir"
 )}"
-# Options used to mount
+
 BTRFS_MOUNT_OPTS=${BTRFS_MOUNT_OPTS:-"compress-force=zstd:2"}
-# Location where the loopback file will be placed.
+
 BTRFS_LOOPBACK_FILE=${BTRFS_LOOPBACK_FILE:-/mnt/btrfs_loopbacks/$(systemd-escape -p "$BTRFS_TARGET_DIR")}
-# Percentage of the total space to use. Max: 1.0, Min: 0.0
 BTRFS_LOOPBACK_FREE=${BTRFS_LOOPBACK_FREE:-"0.8"}
 
-# Result of $(dirname "$_BTRFS_LOOPBACK_FILE")
 btrfs_pdir="$(dirname "$BTRFS_LOOPBACK_FILE")"
 
-# Install btrfs-progs
 sudo apt-get install -y btrfs-progs
 
-# use 60 GB to determine if Github allocated space for /mnt
-# It should have 66GB avail out of 74GB
 MIN_SPACE=$((60 * 1000 * 1000 * 1000))
 
-AVAILABLE=$(findmnt /mnt --bytes --df --json | jq -r '.filesystems[0].avail')
-AVAILABLE_HUMAN=$(findmnt /mnt --df --json | jq -r '.filesystems[0].avail')
+USE_RAID0=false
+if [ -d "/mnt" ]; then
+    AVAILABLE=$(findmnt /mnt --bytes --df --json | jq -r '.filesystems[0].avail // 0')
+    AVAILABLE_HUMAN=$(findmnt /mnt --df --json | jq -r '.filesystems[0].avail // "0B"')
 
-if [[ "$AVAILABLE" -ge "$MIN_SPACE" ]]; then
-  echo "Enough space available: $AVAILABLE_HUMAN"
-else
-  echo "/mnt doesn't have the desired capacity."
-  echo "Available size: $AVAILABLE_HUMAN"
-  echo "This usually happens when many runners are competing for resources"
-  exit 1
+    if [[ "$AVAILABLE" -ge "$MIN_SPACE" ]]; then
+        USE_RAID0=true
+    fi
 fi
 
-# Create loopback file
-sudo mkdir -p "$btrfs_pdir" && sudo chown "$(id -u)":"$(id -g)" "$btrfs_pdir"
-_final_size=$(
-    findmnt --target "$btrfs_pdir" --bytes --df --json |
-        jq -r --arg freeperc "$BTRFS_LOOPBACK_FREE" \
-            '.filesystems[0].avail * ($freeperc | tonumber) | round'
-)
-truncate -s "$_final_size" "$BTRFS_LOOPBACK_FILE"
-unset -v _final_size
+if [ "$USE_RAID0" = true ]; then
+    BTRFS_LOOPBACK_FILE2="/var/example.img"
+    btrfs_pdir2="$(dirname "$BTRFS_LOOPBACK_FILE2")"
 
-# # Stop docker services
-# sudo systemctl stop docker
+    sudo mkdir -p "$btrfs_pdir" && sudo chown "$(id -u)":"$(id -g)" "$btrfs_pdir"
+    sudo mkdir -p "$btrfs_pdir2"
 
-# Format btrfs loopback
-sudo mkfs.btrfs -f -r "$BTRFS_TARGET_DIR" "$BTRFS_LOOPBACK_FILE"
+    _final_size1=$(findmnt --target "$btrfs_pdir" --bytes --df --json | jq -r --arg freeperc "$BTRFS_LOOPBACK_FREE" '.filesystems[0].avail * ($freeperc | tonumber) | round')
+    _final_size2=$(findmnt --target "$btrfs_pdir2" --bytes --df --json | jq -r --arg freeperc "$BTRFS_LOOPBACK_FREE" '.filesystems[0].avail * ($freeperc | tonumber) | round')
 
-# Mount
-sudo systemd-mount "$BTRFS_LOOPBACK_FILE" "$BTRFS_TARGET_DIR" \
-    ${BTRFS_MOUNT_OPTS:+ --options="${BTRFS_MOUNT_OPTS}"}
+    truncate -s "$_final_size1" "$BTRFS_LOOPBACK_FILE"
+    sudo truncate -s "$_final_size2" "$BTRFS_LOOPBACK_FILE2"
+    unset -v _final_size1 _final_size2
 
-# # Restart docker services
-# sudo systemctl start docker
+    LOOP_DEV_1=$(sudo losetup -fP --show "$BTRFS_LOOPBACK_FILE")
+    LOOP_DEV_2=$(sudo losetup -fP --show "$BTRFS_LOOPBACK_FILE2")
+
+    sudo mkfs.btrfs -f -d raid0 -m raid0 "$LOOP_DEV_1" "$LOOP_DEV_2"
+
+    TEMP_MOUNT="/tmp/btrfs_pool_bootstrap"
+    sudo mkdir -p "$TEMP_MOUNT"
+    sudo mount "$LOOP_DEV_1" "$TEMP_MOUNT"
+    sudo btrfs subvolume create "$TEMP_MOUNT/containers"
+    sudo btrfs subvolume create "$TEMP_MOUNT/vartmp"
+    sudo umount "$TEMP_MOUNT"
+    sudo rmdir "$TEMP_MOUNT"
+
+    sudo mkdir -p "$BTRFS_TARGET_DIR"
+    sudo mkdir -p "/var/tmp"
+
+    sudo mount -o "${BTRFS_MOUNT_OPTS},subvol=containers" "$LOOP_DEV_1" "$BTRFS_TARGET_DIR"
+    sudo mount -o "${BTRFS_MOUNT_OPTS},subvol=vartmp" "$LOOP_DEV_1" "/var/tmp"
+else
+    AVAILABLE=$(findmnt / --bytes --df --json | jq -r '.filesystems[0].avail // 0')
+
+    sudo mkdir -p "$btrfs_pdir" && sudo chown "$(id -u)":"$(id -g)" "$btrfs_pdir"
+    _final_size=$(findmnt --target "$btrfs_pdir" --bytes --df --json | jq -r --arg freeperc "$BTRFS_LOOPBACK_FREE" '.filesystems[0].avail * ($freeperc | tonumber) | round')
+    truncate -s "$_final_size" "$BTRFS_LOOPBACK_FILE"
+    unset -v _final_size
+
+    sudo mkfs.btrfs -f -r "$BTRFS_TARGET_DIR" "$BTRFS_LOOPBACK_FILE"
+    sudo mount ${BTRFS_MOUNT_OPTS:+ -o "${BTRFS_MOUNT_OPTS}"} "$BTRFS_LOOPBACK_FILE" "$BTRFS_TARGET_DIR"
+fi

@@ -32,6 +32,22 @@ runs:
           echo "::notice::/mnt mountpoint not detected. Skipping BTRFS loopback..."
         fi
 
+    # there is a very low chance that we do not have /mnt
+    # and only have 20-25G available (without ublue-os/remove-unwanted-software)
+    # this at least gets us 47G
+    - name: Check how much is actually available
+      id: check_how_much
+      if: steps.check_mnt.outputs.mnt_is_there == '0'
+      shell: bash
+      run: |
+        SIZE=30G
+        BYTES_IMAGE_SIZE=$(numfmt --from=iec ${SIZE})
+        FREE_SPACE=$(findmnt -bno AVAIL -T .)
+
+        if [ "${FREE_SPACE}" -lt "${BYTES_IMAGE_SIZE}" ]; then
+          echo "need_removal=1" >> $GITHUB_OUTPUT
+        fi
+
     - name: Mount BTRFS loopback
       id: mount_btrfs
       shell: bash
@@ -44,5 +60,5 @@ runs:
       run: ${{ github.action_path }}/mount_btrfs.sh
 
     - name: Fallback to unwanted-software action
-      if: steps.mount_btrfs.outcome == 'failure'
+      if: steps.check_how_much.outputs.need_removal == '1'
       uses: ublue-os/remove-unwanted-software@695eb75bc387dbcd9685a8e72d23439d8686cba6 # v10
